@@ -1,14 +1,13 @@
 use crate::array_read_ext::ArrayReadExt;
 use crate::hash::HashCRC32;
 use crate::hash_xxh64::HashXXH64;
-use crate::ifs_crypt::IFSCrypt;
 use crate::ifs_structs::{
-    FileIV, IFSBetHeader, IFSBetTable, IFSFileEntry, IFSHeader, IFSHetHeader, IFSHetTable,
-    IVPartLength,
+    FileIV, IFSBetHeader, IFSBetTable, IFSFileEntry, IFSFileFlags, IFSHeader, IFSHetHeader,
+    IFSHetTable, IVPartLength,
 };
 use crate::io_ext::SeekReadExt;
 use crate::struct_read_ext::StructReadExt;
-use crate::utils;
+use crate::{ifs_crypt, utils};
 use aes::Aes192;
 use ctr::{
     Ctr128BE,
@@ -24,16 +23,19 @@ use std::path::Path;
 use walkdir::WalkDir;
 use wow_mpq::{
     crypto::{hash_string, hash_type},
-    decrypt_block,
+    decompress, decrypt_block,
 };
+
+#[cfg(test)]
+use std::io::Write;
 
 // A class that handles reading from IFS packages
 #[derive(Debug, Default, Clone)]
 pub struct IFSLib {
-    // A list of loaded IFS files
-    pub ifs_files: HashMap<u64, IFSFileEntry>,
-    // A list of loaded IFS file paths
-    pub ifs_packages: Vec<String>,
+    // A list of loaded file entries
+    pub file_entries: HashMap<u64, IFSFileEntry>,
+    // A list of loaded IFS package paths
+    pub package_paths: Vec<String>,
 }
 
 impl IFSLib {
@@ -59,7 +61,10 @@ impl IFSLib {
         for entry in WalkDir::new(iips_dir).into_iter().filter_map(|e| e.ok()) {
             let path = entry.path();
             if entry.file_type().is_file() && path.extension().unwrap().eq("ifs") {
-                self.load_package(entry.path())?;
+                #[cfg(test)]
+                println!("Loading {:?}", path);
+
+                self.load_package(path)?;
             }
         }
 
@@ -72,9 +77,11 @@ impl IFSLib {
 
         // Read the header
         let header: IFSHeader = file.read_struct()?;
+
         // Verify magic
-        if header.magic != 0x7366696E {
-            let magic = header.magic;
+        // TODO: Use error result to check function and handle it by `?`
+        if !header.verify_magic() {
+            let magic = header.magic; // aligned for formatting
             let msg = format!("Invalid IFS file magic: expected 0x7366696E, got {magic:#x}");
 
             return Err(msg.into());
@@ -83,12 +90,12 @@ impl IFSLib {
         // Calculate table hashes
         let het_key = hash_string("(hash table)", hash_type::FILE_KEY);
         let bet_key = hash_string("(block table)", hash_type::FILE_KEY);
-        let mut list_file_hash: u64 = 0;
+        let mut lst_hash: Option<u64> = None;
 
         // Add the package to the cache
-        self.ifs_packages.push(file_path.display().to_string());
+        self.package_paths.push(file_path.display().to_string());
         // Get index
-        let package_index = self.ifs_packages.len() - 1;
+        let package_index = self.package_paths.len() - 1;
 
         // Begin HetTable parse -------------------------------------------
         // HetTable header
@@ -144,6 +151,7 @@ impl IFSLib {
         let mut hash_offset = 0;
 
         // Parse and read each entry
+        // TODO: Can use bit offset to load info
         for _ in 0..bet_table.entry_count {
             // New entry, set index
             let mut entry = IFSFileEntry {
@@ -152,7 +160,6 @@ impl IFSLib {
             };
 
             // Read data
-            // TODO: file_size is always == compressed_size? flags is always = 0x80000000?
             entry.file_position =
                 utils::read_bit_len_int(&table_entries, bit_offset, bet_table.bit_count_file_pos)
                     as usize;
@@ -168,9 +175,9 @@ impl IFSLib {
                     as usize;
             bit_offset += bet_table.bit_count_cmp_size;
 
-            entry.flags =
-                utils::read_bit_len_int(&table_entries, bit_offset, bet_table.bit_count_flag_size)
-                    as usize;
+            let flags =
+                utils::read_bit_len_int(&table_entries, bit_offset, bet_table.bit_count_flag_size);
+            entry.flags = IFSFileFlags::from_bits(flags as u32).unwrap();
             bit_offset += bet_table.bit_count_flag_size;
 
             // Skip over unknown data
@@ -182,60 +189,59 @@ impl IFSLib {
                 utils::read_bit_len_uint(&table_hashes, hash_offset, bet_table.hash_size_total);
             hash_offset += bet_table.hash_size_total;
 
-            // Check for list file, starts at header size
-            if entry.file_position == header.header_size as usize && entry.flags == 0x80000000 {
-                list_file_hash = name_hash;
-            }
-
             // Add it
             file_entries.insert(name_hash, entry);
         }
 
         // End --------------------------------------------------------------
 
-        // Find `(listfile)`, it provides the names of all file entries
-        let list_file = file_entries
-            .get(&list_file_hash)
-            .ok_or("List file not found")?;
-
-        // Read the list file
-        let list_file_buffer =
-            file.read_array_at::<u8>(list_file.file_position as u64, list_file.file_size)?;
-
-        // To string
-        let list_file = match String::from_utf8(list_file_buffer) {
-            Ok(s) => s,
-            // Silent failure
-            Err(_) => return Ok(()),
-            // Err(e) => return Err(format!("Invalid UTF-8 in list file: {}", e).into()),
-        };
-
-        // Find list
-        // TODO:
-        if !list_file.contains(".lst\r\n") {
-            return Err("Invalid LST file".into());
+        // Find the list file hash
+        for (&hash, _) in &file_entries {
+            if hash & 0xFFFFFFFF == 0xB2F3866A {
+                lst_hash = Some(hash);
+            }
         }
 
+        if lst_hash.is_none() {
+            return Err("list file hash not found".into());
+        }
+
+        // Get the list file for the names of file entries
+        let lst_file = file_entries
+            .get(&lst_hash.unwrap())
+            .ok_or("list file not found")?;
+
+        let lst_data = self.read_list_file(&mut file, lst_file, &header)?;
+
+        // To string
+        let lst_content =
+            String::from_utf8(lst_data).map_err(|e| format!("Invalid UTF-8 in list file: {e}"))?;
+
         // Split by line, trim the line and check for valid entries
-        for line in list_file.lines().map(str::trim) {
+        for line in lst_content.lines().map(str::trim) {
+            // Skip empty lines
             if line.is_empty() {
                 continue;
             }
 
-            // Calculate XXHash for our searching
-            let entry_hash = line.hash_xxh64();
+            // Calculate BET hash
+            let bet_file_hash = ifs_crypt::bet_hash(line, het_table.hash_entry_size);
 
-            // Jenkins hashlittle2 for HET tables
-            let bet_file_hash = IFSCrypt::bet_hash(line, het_table.hash_entry_size);
-
-            // Check for entry in file
+            // Check if the entries exist by matching the hashes with names from the list file
             if let Some(entry) = file_entries.get_mut(&bet_file_hash) {
-                entry.path = line.to_string();
+                // Set the path for the entry
+                entry.file_path = line.to_string();
+
+                // Calculate XXHash for quick lookup later
+                let entry_hash = line.hash_xxh64();
 
                 // Add the new file
-                match self.ifs_files.entry(entry_hash) {
+                match self.file_entries.entry(entry_hash) {
                     Entry::Vacant(v) => {
                         v.insert(entry.to_owned());
+
+                        // #[cfg(test)]
+                        // println!("Added entry: {}", entry.file_path);
                     }
                     Entry::Occupied(mut o) => {
                         /*let mut msg = format!(
@@ -251,6 +257,7 @@ impl IFSLib {
                             );
                         }
 
+                        #[cfg(test)]
                         println!("{}", msg);*/
 
                         o.insert(entry.to_owned());
@@ -262,18 +269,166 @@ impl IFSLib {
         Ok(())
     }
 
+    pub fn read_list_file(
+        &self,
+        ifs_file: &mut File,
+        lst_entry: &IFSFileEntry,
+        ifs_header: &IFSHeader,
+    ) -> io::Result<Vec<u8>> {
+        // Read the data
+        let lst_cmp_size = lst_entry.compressed_size;
+        let mut lst_buffer =
+            ifs_file.read_array_at::<u8>(lst_entry.file_position as u64, lst_cmp_size)?;
+
+        #[cfg(test)]
+        {
+            let mut f = File::create("listfile_raw.bin")?;
+            f.write_all(&lst_buffer)?;
+            f.flush()?;
+        }
+
+        let encrypted = lst_entry.flags.is_encrypted();
+        let compressed = lst_entry.flags.is_compressed();
+
+        // Return raw data if not encrypted or compressed
+        if !encrypted && !compressed {
+            return Ok(lst_buffer);
+        }
+
+        // Get the hash key for the list file
+        let lst_key: Option<u32> = if encrypted {
+            let key = hash_string("(listfile)", hash_type::FILE_KEY);
+            assert_eq!(key, 0x2D2F0A94);
+
+            Some(key)
+        } else {
+            None
+        };
+
+        if !compressed || lst_entry.flags.is_single_unit() {
+            // Decrypt full data and return directly
+            ifs_crypt::decrypt_file_data(&mut lst_buffer, lst_key.unwrap());
+
+            #[cfg(test)]
+            {
+                let mut f = File::create("listfile_decrypted.bin")?;
+                f.write_all(&lst_buffer)?;
+                f.flush()?;
+            }
+
+            return Ok(lst_buffer);
+        }
+
+        // Get the sector info
+        let max_sector_size = ifs_header.max_sector_size() as usize;
+        let sector_count = (lst_entry.file_size + max_sector_size - 1) / max_sector_size;
+        let sector_offset_count = sector_count + 1;
+        let sector_offset_size = sector_offset_count * size_of::<u32>();
+
+        // Decrypt the offsets
+        if lst_entry.flags.is_encrypted() {
+            ifs_crypt::decrypt_file_data(
+                &mut lst_buffer[..sector_offset_size],
+                lst_key.unwrap().wrapping_sub(1),
+            );
+        }
+
+        // Read the offsets
+        let mut lst_reader = Cursor::new(&mut lst_buffer);
+        let offsets = lst_reader.read_array::<u32>(sector_offset_count)?;
+
+        // #[cfg(test)]
+        // let mut f_decmp = File::create("listfile_decompressed_temp.bin")?;
+
+        // #[cfg(test)]
+        // let mut f_decry = File::create("listfile_decrypted_temp.bin")?;
+
+        let mut buf_uncomp: Vec<u8> = Vec::with_capacity(lst_entry.file_size);
+
+        for i in 0..sector_count {
+            let sector_start = offsets[i];
+            let sector_end = offsets[i + 1];
+
+            let comp_size = (sector_end - sector_start) as usize;
+            let remaining = lst_entry.file_size - i * max_sector_size;
+            let is_raw = comp_size >= remaining || comp_size == max_sector_size; // TODO:
+            let uncmp_size = if is_raw {
+                comp_size
+            } else {
+                std::cmp::min(max_sector_size, remaining)
+            };
+
+            #[cfg(test)]
+            println!(
+                "Processing sector {i}: raw_start={sector_start}, raw_end={sector_end}, is_raw={is_raw}, comp_size={comp_size}, uncmp_size={uncmp_size}",
+            );
+
+            let sector_buffer = &mut lst_buffer[sector_start as usize..sector_end as usize];
+
+            if lst_entry.flags.is_encrypted() {
+                ifs_crypt::decrypt_file_data(
+                    sector_buffer,
+                    lst_key.unwrap().wrapping_add(i as u32),
+                );
+            }
+
+            // #[cfg(test)]
+            // {
+            //     f_decry.write_all(&sector_buffer)?;
+            //     f_decry.flush()?;
+            // }
+
+            if is_raw {
+                buf_uncomp.extend_from_slice(sector_buffer);
+
+                #[cfg(test)]
+                println!("Copied raw sector size: {}", uncmp_size);
+            } else {
+                let sector_buffer =
+                    decompress(&sector_buffer[1..], sector_buffer[0], uncmp_size).unwrap();
+
+                // #[cfg(test)]
+                // {
+                //     f_decmp.write_all(&sector_buffer)?;
+                //     f_decmp.flush()?;
+                // }
+
+                buf_uncomp.extend(sector_buffer);
+
+                #[cfg(test)]
+                println!("Decompressed sector size: {}", uncmp_size);
+            }
+        }
+
+        #[cfg(test)]
+        {
+            let mut f = File::create("listfile_decrypted.bin")?;
+            f.write_all(&lst_buffer)?;
+            f.flush()?;
+        }
+
+        #[cfg(test)]
+        {
+            let mut f = File::create("listfile_decompressed.bin")?;
+            f.write_all(&buf_uncomp)?;
+            f.flush()?;
+        }
+
+        Ok(buf_uncomp)
+    }
+
     pub fn get_entry_hash(entry_path: &str) -> u64 {
         entry_path.hash_xxh64()
     }
 
     pub fn entry_exists_from_path(&self, entry_path: &str) -> bool {
         let entry_hash = Self::get_entry_hash(entry_path);
-        self.ifs_files.contains_key(&entry_hash)
+        self.file_entries.contains_key(&entry_hash)
     }
 
     pub fn try_get_entry(&self, entry_path: &str) -> io::Result<&IFSFileEntry> {
         let entry_hash = Self::get_entry_hash(entry_path);
-        self.ifs_files.get(&entry_hash).ok_or(io::Error::new(
+        self.file_entries.get(&entry_hash).ok_or(io::Error::new(
             io::ErrorKind::NotFound,
             format!("Entry not found: {}", entry_path),
         ))
@@ -287,10 +442,10 @@ impl IFSLib {
 
     // Read an entry
     pub fn read_entry(&self, entry: &IFSFileEntry) -> io::Result<Vec<u8>> {
-        let entry_path = &entry.path;
+        let entry_path = &entry.file_path;
 
         // Open the package for reading
-        let package_path = &self.ifs_packages[entry.file_package_index];
+        let package_path = &self.package_paths[entry.file_package_index];
         let mut reader = File::open(package_path)?;
 
         // Read the data, it's encrypted for some types
@@ -372,66 +527,4 @@ impl IFSLib {
 
         Ok(result_buffer)
     }
-}
-
-#[test]
-fn test_load_image_file() {
-    let iips_path = "E:/Downloads/codol_final/IIPS/IIPSDownload";
-    let ifs_path = "lf_hi_init_common_marketplace_8_V38.1.ifs";
-    let entry_path = "hires/images/sco_l115dragonboat_col.iwi";
-    let expected = "IWi".to_string();
-
-    let mut ifs = IFSLib::new();
-
-    let ifs_path = Path::new(iips_path).join(ifs_path);
-    ifs.load_package(ifs_path.as_path()).unwrap();
-    let entry = ifs.read_entry_from_path(entry_path).unwrap();
-
-    let got = String::from_utf8(entry[..3].to_vec()).unwrap();
-
-    assert_eq!(
-        got, expected,
-        "Entry data mismatch for {:?}: got {:?}, expected {:?}",
-        entry_path, got, expected
-    );
-}
-
-#[test]
-fn test_attach_iips() {
-    let iips_path = "E:/Downloads/codol_final/IIPS/IIPSDownload";
-    let entry_path = "hires/images/sco_l115dragonboat_col.iwi";
-    let expected = "IWi".to_string();
-
-    let mut ifs = IFSLib::new();
-
-    ifs.load_packages(Path::new(iips_path)).unwrap();
-    let entry = ifs.read_entry_from_path(entry_path).unwrap();
-
-    let got = String::from_utf8(entry[..3].to_vec()).unwrap();
-
-    assert_eq!(
-        got, expected,
-        "Entry data mismatch for {:?}: got {:?}, expected {:?}",
-        entry_path, got, expected
-    );
-}
-
-#[test]
-fn test_load_surf_file() {
-    let iips_path = "E:/Downloads/codol_final/IIPS/IIPSDownload";
-    let entry_path = "main/models/wea_scarsapr_slogan_lod210";
-    let expected = 1u32.to_le_bytes();
-
-    let mut ifs = IFSLib::new();
-
-    ifs.load_packages(Path::new(iips_path)).unwrap();
-    let entry = ifs.read_entry_from_path(entry_path).unwrap();
-
-    let got = &entry[..4];
-
-    assert_eq!(
-        got, expected,
-        "Entry data mismatch for {:?}: got {:?}, expected {:?}",
-        entry_path, got, expected
-    );
 }

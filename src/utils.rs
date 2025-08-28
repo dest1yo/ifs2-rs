@@ -4,7 +4,8 @@ pub fn integral_buffer_size(size: u32) -> u32 {
     if (size % 4) == 0 {
         size / 4
     } else {
-        (size / 4) + 1 // Add one for safety
+        // Add one for safety
+        (size / 4) + 1
     }
 }
 

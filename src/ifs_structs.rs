@@ -1,10 +1,12 @@
+use bitflags::bitflags;
+
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
 pub struct IFSHeader {
     pub magic: u32,
     pub header_size: u32,
     pub format_version: u16,
-    pub sector_size: u16,
+    pub sector_size_shift: u16,
 
     pub archive_size: u64,
     pub bet_table_pos: u64,
@@ -19,6 +21,16 @@ pub struct IFSHeader {
 
     pub md5_piece_size: u32,
     pub raw_chunk_size: u32,
+}
+
+impl IFSHeader {
+    pub fn verify_magic(&self) -> bool {
+        self.magic == 0x7366696E // 'nifs'
+    }
+
+    pub fn max_sector_size(&self) -> u32 {
+        0x200 << self.sector_size_shift
+    }
 }
 
 #[repr(C, packed)]
@@ -123,10 +135,73 @@ impl IVPartLength {
 
 #[derive(Debug, Clone, Default)]
 pub struct IFSFileEntry {
-    pub path: String,
+    pub file_path: String,
     pub file_package_index: usize,
     pub file_position: usize,
     pub file_size: usize,
     pub compressed_size: usize,
-    pub flags: usize,
+    pub flags: IFSFileFlags,
+}
+
+bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+    pub struct IFSFileFlags: u32 {
+        /// File is compressed using PKWARE Data Compression Library
+        const IMPLODE       = 0x00000100;
+        /// File is compressed using combination of algorithms
+        const COMPRESS      = 0x00000200;
+        /// File is encrypted
+        const ENCRYPTED     = 0x00010000;
+        /// Encryption key adjusted by file offset
+        const KEY_ADJUSTED  = 0x00020000;
+        /// File is a patch file
+        const PATCH_FILE    = 0x00100000;
+        /// File is stored as single unit (not split into sectors)
+        const SINGLE_UNIT   = 0x01000000;
+        /// File is marked for deletion
+        const DELETE_MARKER = 0x02000000;
+        /// File has checksums for each sector (ADLER32, not CRC32)
+        const SECTOR_CRC    = 0x04000000;
+        /// File exists in the archive
+        const EXISTS        = 0x80000000;
+        // Unknown flags
+        const UNKNOWN_1     = 0x08000000;
+    }
+}
+
+impl IFSFileFlags {
+    /// Check if the file is compressed
+    pub fn is_compressed(self) -> bool {
+        self.intersects(IFSFileFlags::IMPLODE | IFSFileFlags::COMPRESS)
+    }
+
+    /// Check if the file is encrypted
+    pub fn is_encrypted(self) -> bool {
+        self.contains(IFSFileFlags::ENCRYPTED)
+    }
+
+    /// Check if the file is stored as a single unit
+    pub fn is_single_unit(self) -> bool {
+        self.contains(IFSFileFlags::SINGLE_UNIT)
+    }
+
+    /// Check if the file has sector CRCs
+    pub fn has_sector_crc(self) -> bool {
+        self.contains(IFSFileFlags::SECTOR_CRC)
+    }
+
+    /// Check if the file exists
+    pub fn exists(self) -> bool {
+        self.contains(IFSFileFlags::EXISTS)
+    }
+
+    /// Check if the file uses fixed key encryption
+    pub fn has_fix_key(self) -> bool {
+        self.contains(IFSFileFlags::KEY_ADJUSTED)
+    }
+
+    /// Check if the file is a patch file
+    pub fn is_patch_file(self) -> bool {
+        self.contains(IFSFileFlags::PATCH_FILE)
+    }
 }

@@ -7,8 +7,8 @@ mod ifs_crypt;
 mod ifs_lib;
 mod ifs_structs;
 mod io_ext;
-mod string_read_ext;
 mod struct_read_ext;
+mod tests;
 mod utils;
 
 pub use ifs_lib::*;
