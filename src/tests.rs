@@ -69,6 +69,29 @@ mod tests {
         );
     }
 
+    // load all packages from directory, and read sound file entry
+    #[test]
+    fn test_read_sound() {
+        let entry_path = "main/sound/voiceovers/codo_mp/ancr/scar/AB_1mc_use_moab_01.mp3"
+            .to_lowercase()
+            .replace('/', "\\");
+        let expected = b"ID3";
+
+        let mut ifs = IFSLib::new();
+        ifs.load_packages(Path::new(IIPS_PATH)).unwrap();
+
+        assert_eq!(ifs.entry_exists_from_path(&entry_path), true);
+
+        let entry = ifs.read_entry_from_path(entry_path.as_str()).unwrap();
+        let got = &entry[..3];
+
+        assert_eq!(
+            got, expected,
+            "Entry data mismatch for {:?}: got {:?}, expected {:?}",
+            entry_path, got, expected
+        );
+    }
+
     // for verifying new method to read .lst works, but we don't use .lst anymore now
     #[test]
     fn test_load_surf_file_v2() {
@@ -98,7 +121,7 @@ mod tests {
         let ifs_path = Path::new(IIPS_PATH).join(ifs_name);
 
         let mut ifs = IFSLib::new();
-        ifs.load_package(Path::new(&ifs_path)).unwrap();
+        ifs.load_package(&ifs_path).unwrap();
     }
 
     // list file encrypted, and compressed with 2 sectors
@@ -108,7 +131,7 @@ mod tests {
         let ifs_path = Path::new(IIPS_PATH).join(ifs_name);
 
         let mut ifs = IFSLib::new();
-        ifs.load_package(Path::new(&ifs_path)).unwrap();
+        ifs.load_package(&ifs_path).unwrap();
     }
 
     // list file encrypted, but not compressed
@@ -118,7 +141,7 @@ mod tests {
         let ifs_path = Path::new(IIPS_PATH).join(ifs_name);
 
         let mut ifs = IFSLib::new();
-        ifs.load_package(Path::new(&ifs_path)).unwrap();
+        ifs.load_package(&ifs_path).unwrap();
     }
 
     // load single package, and read ff file entry

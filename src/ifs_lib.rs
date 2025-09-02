@@ -189,6 +189,11 @@ impl IFSLib {
                 utils::read_bit_len_uint(&table_hashes, hash_offset, bet_table.hash_size_total);
             hash_offset += bet_table.hash_size_total;
 
+            // Skip the folders or invalid entries
+            if entry.file_size == 0 || !entry.flags.exists() {
+                continue;
+            }
+
             // Add it
             file_entries.insert(name_hash, entry);
         }
@@ -217,6 +222,45 @@ impl IFSLib {
         let lst_content =
             String::from_utf8(lst_data).map_err(|e| format!("Invalid UTF-8 in list file: {e}"))?;
 
+        // Find the lst file
+        let mut hashes: Option<HashMap<u64, String>> = None;
+        for line in lst_content.lines().map(str::trim) {
+            if !line.is_empty() && line.ends_with(".lst") {
+                hashes = Some(HashMap::new());
+
+                // Calculate BET hash
+                let lst_hash = ifs_crypt::bet_hash(line, het_table.hash_entry_size);
+
+                // Get the lst file for the names with original case of file entries
+                let lst_file = file_entries.get(&lst_hash).ok_or("lst file not found")?;
+
+                // Read the lst file
+                let lst_data = self.read_list_file(&mut file, lst_file, &header)?;
+
+                // To string
+                let lst_content = String::from_utf8(lst_data)
+                    .map_err(|e| format!("Invalid UTF-8 in lst file: {e}"))?;
+
+                // Split by line, trim the line and check for valid entries
+                for line in lst_content.lines().map(str::trim) {
+                    // Skip empty lines
+                    if line.is_empty() {
+                        continue;
+                    }
+
+                    // Calculate BET hash
+                    let bet_file_hash = ifs_crypt::bet_hash(line, het_table.hash_entry_size);
+
+                    hashes
+                        .as_mut()
+                        .unwrap()
+                        .insert(bet_file_hash, line.to_string());
+                }
+
+                break;
+            }
+        }
+
         // Split by line, trim the line and check for valid entries
         for line in lst_content.lines().map(str::trim) {
             // Skip empty lines
@@ -230,7 +274,21 @@ impl IFSLib {
             // Check if the entries exist by matching the hashes with names from the list file
             if let Some(entry) = file_entries.get_mut(&bet_file_hash) {
                 // Set the path for the entry
-                entry.file_path = line.to_string();
+                if let Some(hashes) = hashes.as_ref() {
+                    // Use original case names if available
+                    if hashes.contains_key(&bet_file_hash) {
+                        entry.file_path = hashes.get(&bet_file_hash).unwrap().clone();
+                    } else {
+                        // No original case names available, should not happen
+                        return Err(
+                            format!("Original case name not found for entry: {}", line).into()
+                        );
+                    }
+                } else {
+                    // No original case names available, use lower case
+                    // Some IFS packages don't have a lst file
+                    entry.file_path = line.to_string();
+                }
 
                 // Calculate XXHash for quick lookup later
                 let entry_hash = line.hash_xxh64();
@@ -442,28 +500,30 @@ impl IFSLib {
 
     // Read an entry
     pub fn read_entry(&self, entry: &IFSFileEntry) -> io::Result<Vec<u8>> {
+        // Get the file path
         let entry_path = &entry.file_path;
 
         // Open the package for reading
         let package_path = &self.package_paths[entry.file_package_index];
         let mut reader = File::open(package_path)?;
 
-        // Read the data, it's encrypted for some types
+        // Read the data
         let entry_data =
             reader.read_array_at::<u8>(entry.file_position as u64, entry.compressed_size)?;
 
-        // Not encrypted
+        // Some files are not encrypted or compressed, return directly
         // TODO: Any flags to check if encrypted?
         if entry_path.ends_with(".ff") || entry_path.ends_with(".lst") {
             return Ok(entry_data);
         };
 
+        // The file data is encrypted
         let mut enc_data_reader = Cursor::new(&entry_data);
 
-        // The packed size
+        // Calculate the packed size
         let packed_size = entry_data.len() - 4;
 
-        // The unpacked size is appended to the end
+        // Read the unpacked size from the end of the file
         enc_data_reader.seek(SeekFrom::End(-4))?;
         let unpacked_size = enc_data_reader.read_struct::<u32>()? as usize;
 
@@ -471,18 +531,22 @@ impl IFSLib {
         let file_name = Path::new(entry_path).file_name().unwrap().to_str().unwrap();
         let nonce = file_name.hash_crc32(file_name.len() as u32);
 
-        // Build the IV
+        // Build the file IV
         let mut file_iv = FileIV {
             nonce,
             unpacked_size: unpacked_size as u32,
             iv_counter: Default::default(),
         };
 
+        // The chunk size to decrypt at once
+        const CRYPT_CHUNK_SIZE: usize = 0x8000;
+
         // Allocate the buffers
-        let mut encrypted_buffer = vec![0u8; 0x8000];
+        let mut encrypted_buffer = vec![0u8; CRYPT_CHUNK_SIZE];
         let mut decrypted_buffer = vec![0u8; packed_size];
         let mut result_buffer = vec![0u8; unpacked_size];
 
+        // The current offset in the packed data
         let mut packed_offset = 0;
 
         // Go back to start
@@ -490,19 +554,20 @@ impl IFSLib {
 
         // Decrypt chunks
         while packed_offset < packed_size {
+            // Calculate the block size
             let left = packed_size - packed_offset;
-            let block_size = left.min(0x8000);
+            let block_size = left.min(CRYPT_CHUNK_SIZE);
 
-            // Shift the index
+            // Update the IV counter
             file_iv.iv_counter = IVPartLength {
                 iv_index: packed_offset as u32,
                 iv_block_size: block_size as u32,
             };
 
-            // Set the IV Counter
+            // Generate the cipher
             let mut cipher = Self::generate_cipher(&file_iv.to_bytes());
 
-            // Read the data
+            // Read the chunk
             enc_data_reader.read_exact(&mut encrypted_buffer[..block_size])?;
 
             // Decrypt the buffer
@@ -517,11 +582,26 @@ impl IFSLib {
             packed_offset += block_size;
         }
 
-        // Decompress
-        if packed_offset > 0 {
-            assert_eq!(decrypted_buffer[..2], [0x78, 0xDA], "Invalid zlib header");
-            let mut decoder = ZlibDecoder::new(decrypted_buffer.as_slice());
+        // Check if we have decrypted data
+        if packed_offset == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "No data decrypted",
+            ));
+        }
 
+        // Decompress
+        {
+            // Verify zlib header
+            if decrypted_buffer[..2] != [0x78, 0xDA] {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Invalid zlib header",
+                ));
+            }
+
+            // Decompress using zlib
+            let mut decoder = ZlibDecoder::new(decrypted_buffer.as_slice());
             decoder.read_exact(&mut result_buffer)?;
         }
 
